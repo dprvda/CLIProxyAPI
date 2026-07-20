@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -274,7 +275,6 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	// This allows proper cleanup and cancellation of ongoing requests
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
@@ -282,7 +282,69 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
-	// Peek at the first chunk to determine success or failure before setting headers
+	// A high-effort model reasoning over a large context can take minutes to produce
+	// its first token. The upstream stays silent that whole time, and
+	// ExecuteStreamWithAuthManager blocks until the first payload chunk. With no bytes
+	// flowing, the client treats the stream as idle and disconnects, cancelling the
+	// request ("context canceled"). So while waiting for that first chunk, run a
+	// keepalive goroutine that emits SSE heartbeats. It commits the response headers on
+	// its first tick; requests that resolve before then (the common case, including
+	// immediate upstream errors) keep their normal HTTP status. The goroutine is the
+	// only writer until it is stopped and joined below, so there is no write race.
+	var writeMu sync.Mutex
+	headersSent := false
+	commitHeadersLocked := func() {
+		if !headersSent {
+			setSSEHeaders()
+			headersSent = true
+		}
+	}
+	keepAliveInterval := handlers.StreamingKeepAliveInterval(h.Cfg)
+	stopKeepAlive := make(chan struct{})
+	var keepAliveWG sync.WaitGroup
+	if keepAliveInterval > 0 {
+		keepAliveWG.Add(1)
+		go func() {
+			defer keepAliveWG.Done()
+			ticker := time.NewTicker(keepAliveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopKeepAlive:
+					return
+				case <-c.Request.Context().Done():
+					return
+				case <-ticker.C:
+					writeMu.Lock()
+					commitHeadersLocked()
+					_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+					flusher.Flush()
+					writeMu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// Blocks until the first payload chunk (or an error); heartbeats fire meanwhile.
+	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+
+	// Stop heartbeating before this goroutine takes over writing to the client.
+	close(stopKeepAlive)
+	keepAliveWG.Wait()
+	writeMu.Lock()
+	committed := headersSent
+	writeMu.Unlock()
+
+	writeStreamError := func(errMsg *interfaces.ErrorMessage) {
+		if errMsg == nil {
+			return
+		}
+		errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+		flusher.Flush()
+	}
+
+	// Peek at the first chunk to determine success or failure before setting headers.
 	for {
 		select {
 		case <-c.Request.Context().Done():
@@ -294,8 +356,13 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 				errChan = nil
 				continue
 			}
-			// Upstream failed immediately. Return proper error status and JSON.
-			h.WriteErrorResponse(c, errMsg)
+			// Upstream failed. If a heartbeat already committed the headers the HTTP
+			// status is gone, so surface the error as an SSE error event.
+			if committed {
+				writeStreamError(errMsg)
+			} else {
+				h.WriteErrorResponse(c, errMsg)
+			}
 			if errMsg != nil {
 				cliCancel(errMsg.Error)
 			} else {
@@ -305,7 +372,11 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 		case chunk, ok := <-dataChan:
 			if !ok {
 				if errMsg, okPendingErr := pendingClaudeStreamError(errChan); okPendingErr {
-					h.WriteErrorResponse(c, errMsg)
+					if committed {
+						writeStreamError(errMsg)
+					} else {
+						h.WriteErrorResponse(c, errMsg)
+					}
 					if errMsg != nil {
 						cliCancel(errMsg.Error)
 					} else {
@@ -313,17 +384,21 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 					}
 					return
 				}
-				// Stream closed without data? Send DONE or just headers.
-				setSSEHeaders()
-				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				// Stream closed without data? Send headers (if not already) and finish.
+				if !committed {
+					setSSEHeaders()
+					handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+				}
 				flusher.Flush()
 				cliCancel(nil)
 				return
 			}
 
-			// Success! Set headers now.
-			setSSEHeaders()
-			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			// Success! Set headers now unless a heartbeat already committed them.
+			if !committed {
+				setSSEHeaders()
+				handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+			}
 
 			// Write the first chunk
 			if len(chunk) > 0 {
