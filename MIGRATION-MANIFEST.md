@@ -51,9 +51,14 @@ service comes back. Read `docs/planning/linux-migration-2026-08-20.md` +
 ## Secrets
 - OAuth credential JSONs + `config.yaml` at `C:\Users\dprvd\.cli-proxy-api\` are NOT in this
   repo's git history (repo's own `auths/` stays an empty placeholder).
-- Per plan, harvest target is 1Password vault `btc-bot-dev`, doc `migration/C/Users/dprvd/
-  .cli-proxy-api/<file>`, indexed by `migration/INDEX` — harvest status NOT verified by this
-  pass; confirm before treating those Google-account OAuth tokens as recoverable.
+- Harvest CONFIRMED (verified 2026-08-20 via `op item list --vault btc-bot-dev`, service token
+  from `Documents\btc_bot\.env`): vault `btc-bot-dev` holds `migration/.cli-proxy-api/
+  config.yaml` plus 8 OAuth credential items under `migration/.cli-proxy-api/auth/` —
+  `claude-dprvda@gmail.com.json`, `claude-danylopravda3d@gmail.com.json`,
+  `claude-izv.danil@gmail.com.json`, `claude-pattiterrainmiser@gmail.com.json`, `.disabled`
+  variants of the first two, and `codex-danylopravda3d@gmail.com-pro.json` +
+  `codex-e48396de-izv.danil@gmail.com-pro.json`. Indexed by `migration/INDEX` alongside 412
+  total `migration/<path>` documents in the vault.
 
 ## Remote
 - `fork` = `https://github.com/dprvda/CLIProxyAPI.git` (push target, owner's fork) — checked
