@@ -183,6 +183,7 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
 		}
+		overlayEmbeddedOnlyModels(&parsed)
 
 		return &parsed, url
 	}
@@ -293,6 +294,57 @@ func mergeProviderNames(existing, incoming []string) []string {
 		merged = append(merged, name)
 	}
 	return merged
+}
+
+// overlayEmbeddedOnlyModels appends models that exist in the embedded catalog
+// but are absent from a remotely fetched one. This fork registers models locally
+// (in models/models.json) before the remote catalog publishes them — e.g.
+// claude-fable-5-1 — and the remote refresh replaces the store wholesale, which
+// would silently drop them for up to a release cycle. Remote entries win when
+// both define the same ID, so published metadata updates still land.
+func overlayEmbeddedOnlyModels(parsed *staticModelsJSON) {
+	var embedded staticModelsJSON
+	if err := json.Unmarshal(embeddedModelsJSON, &embedded); err != nil {
+		return
+	}
+	sections := []struct {
+		remote   *[]*ModelInfo
+		embedded []*ModelInfo
+	}{
+		{&parsed.Claude, embedded.Claude},
+		{&parsed.Gemini, embedded.Gemini},
+		{&parsed.Vertex, embedded.Vertex},
+		{&parsed.AIStudio, embedded.AIStudio},
+		{&parsed.CodexFree, embedded.CodexFree},
+		{&parsed.CodexTeam, embedded.CodexTeam},
+		{&parsed.CodexPlus, embedded.CodexPlus},
+		{&parsed.CodexPro, embedded.CodexPro},
+		{&parsed.Kimi, embedded.Kimi},
+		{&parsed.Antigravity, embedded.Antigravity},
+		{&parsed.XAI, embedded.XAI},
+	}
+	for _, section := range sections {
+		present := make(map[string]struct{}, len(*section.remote))
+		for _, model := range *section.remote {
+			if model == nil {
+				continue
+			}
+			present[strings.ToLower(strings.TrimSpace(model.ID))] = struct{}{}
+		}
+		for _, model := range section.embedded {
+			if model == nil {
+				continue
+			}
+			id := strings.ToLower(strings.TrimSpace(model.ID))
+			if id == "" {
+				continue
+			}
+			if _, exists := present[id]; exists {
+				continue
+			}
+			*section.remote = append(*section.remote, cloneModelInfo(model))
+		}
+	}
 }
 
 func loadModelsFromBytes(data []byte, source string) error {
